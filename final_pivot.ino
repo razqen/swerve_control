@@ -8,15 +8,10 @@
 #define MOTOR_SPEED 255
 const int TOLERANCE = 75;
 
-//#define input_2 39 //VN
-//#define input_1 36 //VP
-//#define feedback_pin 2
-//115 wheel 4
-
 const int limitSwitchPin[4] = { 36, 35, 34, 39 }; //needs rechecking
-const int pwm[4] = { 23, 21, 18, 17 };//5,17,16,22
-const int dir[4] = { 22, 19, 5, 16 };//15,21,4,23
-const int ABS_ENC_PIN[4] = { 32, 25, 27, 12 };// 26,14,25,33
+const int pwm[4] = { 23, 21, 18, 17 }; //5,17,16,22
+const int dir[4] = { 22, 19, 5, 16 }; //15,21,4,23
+const int ABS_ENC_PIN[4] = { 32, 25, 27, 12 }; // 26,14,25,33
 int ZERO_DEG_OFFSET[4] =  { 2350, 1820, 1383, 1920 };
 int target_enc[4] =  { ZERO_DEG_OFFSET[0], ZERO_DEG_OFFSET[1], ZERO_DEG_OFFSET[2], ZERO_DEG_OFFSET[3] };
 bool homed[4] = { false, false, false, false };
@@ -64,17 +59,15 @@ void subscription_callback(const void * msgin) {
     }
   }
 
-    for (int i = 0; i < 4; i++) {
-      target_enc[i] = ZERO_DEG_OFFSET[i] + (int)((msg->data.data[i] / 360.0f) * 4096.0f);
+  for (int i = 0; i < 4; i++) {
+    target_enc[i] = ZERO_DEG_OFFSET[i] + (int)((msg->data.data[i] / 360.0f) * 4096.0f);
       
-      // wrapping around target in case angles were greater than 360 or negative
-      target_enc[i] = target_enc[i] % 4096;
-      if (target_enc[i] < 0)
-        target_enc[i] += 4096;
-    }
-    // Lock into ROS mode so loop() doesn't overwrite these targets
+    // wrapping around target in case angles were greater than 360 or negative
+    target_enc[i] = target_enc[i] % 4096;
+    if (target_enc[i] < 0) target_enc[i] += 4096;
+  }
+  // Lock into ROS mode so loop() doesn't overwrite these targets
 }
-
 
 void setMotor(int speed, bool direction, int M_PWM, int M_DIR) {
   //make pin compatible
@@ -102,10 +95,6 @@ void setup() {
   pinMode(limitSwitchPin[1], INPUT_PULLDOWN);
   pinMode(limitSwitchPin[2], INPUT_PULLDOWN); 
   pinMode(limitSwitchPin[3], INPUT_PULLDOWN); 
-
-  // pinMode(input_1, INPUT);
-  // pinMode(input_2, INPUT);
-  // pinMode(feedback_pin, OUTPUT);
 
   set_microros_transports(); // Initializes transport (default over Serial)
 
@@ -141,7 +130,6 @@ void setup() {
   rclc_executor_add_subscription(&executor, &subscriber, &msg, &subscription_callback, ON_NEW_DATA);
 }
 
-
 void loop() {
   rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
 
@@ -158,28 +146,32 @@ void loop() {
     if (homing) {
         if (swHigh) {
             setMotor(0, false, pwm[i], dir[i]);
-            if (!homed[i]){
-              setMotor(0, false, pwm[i], dir[i]);
+            if (!homed[i]) {
               ZERO_DEG_OFFSET[i] = current_position[i];
               homed[i] = true;
             }
+        } else {
+            if (homed[i]) {
+              // wheel just left the switch
+              int homeErr = ZERO_DEG_OFFSET[i] - current_position[i];
+              if (homeErr > 2048) homeErr -= 4096;
+              else if (homeErr < -2048) homeErr += 4096;
+              homingDir[i] = (homeErr > 0) ? !dirclockhigh[i] : dirclockhigh[i];
+            }
+            homed[i] = false;
+            setMotor(MOTOR_SPEED, homingDir[i], pwm[i], dir[i]);
         }
-        else setMotor(MOTOR_SPEED, homingDir[i], pwm[i], dir[i]);
     } else {
         homed[i] = homed[i] || swHigh;
         if (abs(error[i]) <= TOLERANCE) setMotor(0, false, pwm[i], dir[i]);
         else setMotor(MOTOR_SPEED, motor_dir, pwm[i], dir[i]);
     }
-}
+  }
 
   // publishing current encoder values on "pivot_encoders"
   for (int i = 0; i < 4; i++) pub_msg_data[i] = (float)current_position[i];
   rcl_ret_t ret = rcl_publish(&publisher, &pub_msg, NULL);
   (void)ret;
-//  if(abs(error[1])<=TOLERANCE&&abs(error[3])<=TOLERANCE){
-//      digitalWrite(feedback_pin, LOW);     
-//  }
 }
 
-//while implementing subscriber for pivot ackerman , just add tolerance change in the subscriber
 
