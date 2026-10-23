@@ -1,0 +1,32 @@
+term 1: python3 rover_tui.py
+
+term 1.5: python3 rsp.launch.py
+
+term 2: ros2 launch realsense2_camera rs_launch.py \
+  initial_reset:=true \
+  depth_module.depth_profile:=640x480x15 \
+  rgb_camera.color_profile:=424x240x6 \
+  align_depth.enable:=true \
+  pointcloud.enable:=true \
+  pointcloud.allow_no_texture_points:=true
+
+
+term 3: ros2 launch rtabmap_launch rtabmap.launch.py frame_id:=base_link rgb_topic:=/camera/camera/color/image_raw depth_topic:=/camera/camera/aligned_depth_to_color/image_raw camera_info_topic:=/camera/camera/color/camera_info approx_sync:=true qos:=1 queue_size:=30 wait_imu_to_init:=false args:="--delete_db_on_start --Grid/RangeMax 4.0 --Grid/CellSize 0.05 --Grid/MaxObstacleHeight 1.5" frame_id:=base_footprint
+
+term 4: ros2 run pointcloud_to_laserscan pointcloud_to_laserscan_node --ros-args -r cloud_in:=/camera/camera/depth/color/points -r scan:=/scan -p target_frame:=base_link -p min_height:=0.05 -p max_height:=0.5 -p range_min:=0.3 -p range_max:=4.0 -p use_inf:=true
+
+check /scan in rviz
+
+term 5: ros2 run nav2_collision_monitor collision_monitor --ros-args --params-file <share>/config/collision_monitor.yaml
+
+term 6: ros2 run nav2_lifecycle_manager lifecycle_manager --ros-args -r __node:=lifecycle_manager_collision_monitor -p autostart:=true -p node_names:="['collision_monitor']"
+
+RESTART controller as: python3 controller_sh.py --ros-args -r /cmd_vel:=/cmd_vel_safe --ros-args -p max_angular_accel:=0.3
+
+term 7: ros2 launch rover_for_software_unfucked_description nav2.launch.py slam:=true odom_topic:=/rtabmap/odom
+
+
+term 8: ros2 launch rover_for_software_unfucked_description sim.launch.py world:=textured slam:=true nav2:=true   rtabmap_extra_args:="--Grid/NormalsSegmentation false --Grid/MaxGroundHeight 0.05 --Grid/NoiseFilteringRadius 0.1 --Grid/NoiseFilteringMinNeighbors 4" odom_mode:=visual
+
+
+also lower speeds in nav2 params file
