@@ -18,8 +18,9 @@ Run it from a shell where ROS is sourced (so `ros2` and micro_ros_agent work):
     python3 rover_tui.py
 
 Keys:  u i o / j k l / m , .   drive (space = stop)
+       Caps Lock toggles crab/holonomic mode (shifted teleop keys); Space = stop
        q/z  all speeds +/-10%   w/x  linear +/-   e/c  angular +/-
-       1 / 2  manual reset ESP-0 / ESP-1      F5 / F6  restart controller / teleop
+       1 / 2  manual reset ESP-0 / ESP-1      F5 / F6 / F7 / F8  restart controller / teleop / pivot echo / joy_drive
        Ctrl+Q  quit (sends a stop first)
 """
 from __future__ import annotations
@@ -41,12 +42,16 @@ from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import Footer, RichLog, Static
+from textual.widgets import Button, Footer, RichLog, Static
 
 # ════════════════════════════ config ════════════════════════════
 CONTROLLER_CMD = ["python3", "controller_sh.py"]
 CONTROLLER_CWD = None  # None = directory you launch this from
 TELEOP_CMD = ["ros2", "run", "teleop_twist_keyboard", "teleop_twist_keyboard"]
+PIVOT_ECHO_CMD = ["ros2", "topic", "echo", "/pivot_encoders"]
+JOY_DRIVE_CMD = ["python3", "joy_drive.py"]
+# Change this path to select a different AntiMicroX controller profile.
+ANTIMICROX_PROFILE = "~/rover.gamecontroller.amgp"
 
 ESPS = [("ESP-0", "/dev/ttyUSB0"), ("ESP-1", "/dev/ttyUSB1")]
 
@@ -294,6 +299,7 @@ class KeyPad(Static):
         self.last: dict[str, float] = {}
         self.lin: float | None = None
         self.ang: float | None = None
+        self.crab_mode = False
 
     def on_mount(self) -> None:
         self.border_title = "TELEOP // TWIST"
@@ -304,6 +310,9 @@ class KeyPad(Static):
 
     def set_speed(self, lin: float, ang: float) -> None:
         self.lin, self.ang = lin, ang
+
+    def set_crab_mode(self, enabled: bool) -> None:
+        self.crab_mode = enabled
 
     def _level(self, key: str, now: float) -> int:
         age = now - self.last.get(key, -1e9)
@@ -341,7 +350,9 @@ class KeyPad(Static):
         else:
             out.append(f"  LIN {self.lin:5.2f} m/s   ANG {self.ang:5.2f} rad/s", style="bold #4fe3f5")
         out.append("\n")
-        out.append("  q/z all±  w/x lin±  e/c ang±   space = stop", style="#2a6f7a")
+        out.append("  q/z all±  w/x lin±  e ang+  c crab toggle  space = stop", style="#2a6f7a")
+        out.append("\n  CRAB MODE  ", style="bold #001014 on #4fe3f5" if self.crab_mode else "#2a6f7a")
+        out.append("ON" if self.crab_mode else "OFF", style="bold #001014 on #19c37d" if self.crab_mode else "bold #e5c07b")
         self.update(out)
 
 
@@ -572,7 +583,7 @@ class RoverTUI(App):
     #hdr { height: 1; background: #07161b; padding: 0 1; }
     #top { height: 1fr; }
     #esps { width: 1fr; }
-    KeyPad { width: 52; height: 100%; border: round #1f6f7d; border-title-color: #4fe3f5;
+    KeyPad { width: 52; height: 1fr; border: round #1f6f7d; border-title-color: #4fe3f5;
              content-align: center middle; background: #03080b; }
     EspPanel { height: 1fr; border: round #1f6f7d; border-title-color: #4fe3f5;
                padding: 0 1; background: #03080b; overflow: hidden; }
@@ -582,8 +593,11 @@ class RoverTUI(App):
     EspPanel.s-error     { border: round #ff4d4d; border-title-color: #ff4d4d; }
     EspPanel.s-resetting { border: round #c678dd; border-title-color: #c678dd; }
     EspPanel.s-failed    { border: heavy #ff4d4d; border-title-color: #ff4d4d; }
+    #controls { width: 52; height: 100%; }
+    #crab { height: 3; margin: 0 1; border: round #1f6f7d; background: #03080b; color: #2fd0e6; }
+    #crab.crab-on { border: heavy #19c37d; background: #06251a; color: #8affc5; text-style: bold; }
     #bottom { height: 12; }
-    ProcLog { width: 1fr; border: round #1f6f7d; border-title-color: #4fe3f5; background: #03080b; }
+    ProcLog { width: 1fr; min-width: 0; border: round #1f6f7d; border-title-color: #4fe3f5; background: #03080b; }
     Footer { background: #07161b; }
     """
 
@@ -592,31 +606,66 @@ class RoverTUI(App):
         Binding("2", "reset_esp(1)", "Reset ESP-1"),
         Binding("f5", "restart_controller", "Restart controller"),
         Binding("f6", "restart_teleop", "Restart teleop"),
+        Binding("f7", "restart_pivot_echo", "Restart pivot echo"),
+        Binding("f8", "restart_joy_drive", "Restart joy_drive.py"),
         Binding("ctrl+q", "quit", "Quit"),
     ]
 
     def __init__(self):
         super().__init__()
         self._down = False
+        self.antimicrox_proc: asyncio.subprocess.Process | None = None
 
     def compose(self) -> ComposeResult:
         self.pad = KeyPad(id="pad")
         self.controller = ProcLog("controller_sh.py", CONTROLLER_CMD, cwd=CONTROLLER_CWD)
         self.teleop = ProcLog("teleop_twist_keyboard", TELEOP_CMD, on_text=self._teleop_text)
+        self.pivot_echo = ProcLog("ros2 topic echo /pivot_encoders", PIVOT_ECHO_CMD)
+        self.joy_drive = ProcLog("joy_drive.py", JOY_DRIVE_CMD)
         self.esps = [EspPanel(n, p, i + 1) for i, (n, p) in enumerate(ESPS)]
         yield Static(id="hdr")
+        self.crab_button = Button("CRAB MODE: OFF  [c to toggle]", id="crab", disabled=True)
         with Horizontal(id="top"):
-            yield self.pad
+            with Vertical(id="controls"):
+                yield self.pad
+                yield self.crab_button
             with Vertical(id="esps"):
                 for p in self.esps:
                     yield p
         with Horizontal(id="bottom"):
             yield self.controller
             yield self.teleop
+            yield self.pivot_echo
+            yield self.joy_drive
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.set_interval(0.5, self._header)
+        await self.start_antimicrox()
+
+    async def start_antimicrox(self) -> None:
+        """Launch AntiMicroX hidden with the configured profile."""
+        profile = os.path.abspath(os.path.expanduser(ANTIMICROX_PROFILE))
+        if not os.path.isfile(profile):
+            self.notify(f"AntiMicroX profile not found: {profile}", severity="error")
+            return
+        try:
+            self.antimicrox_proc = await asyncio.create_subprocess_exec(
+                "antimicrox", "--hidden", "--profile", profile,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            self.notify("antimicrox not found; install it or check PATH", severity="error")
+        except Exception as e:
+            self.notify(f"Could not launch AntiMicroX: {e}", severity="error")
+
+    def set_crab_mode(self, enabled: bool) -> None:
+        self.pad.set_crab_mode(enabled)
+        self.crab_button.label = "CRAB MODE: ON  [c to toggle]" if enabled else "CRAB MODE: OFF  [c to toggle]"
+        self.crab_button.set_class(enabled, "crab-on")
 
     def _header(self) -> None:
         t = Text(no_wrap=True)
@@ -638,7 +687,26 @@ class RoverTUI(App):
         ch = event.character
         if ch == " ":
             ch = "k"
+
+        # Use c as a dedicated crab-mode toggle. Do not forward it to teleop,
+        # where c normally decreases angular speed.
+        if ch and ch.lower() == "c":
+            self.set_crab_mode(not self.pad.crab_mode)
+            event.stop()
+            return
+
         if ch and ch in TELEOP_KEYS | {"k"}:
+            # teleop_twist_keyboard uses shifted movement keys for strafing.
+            # In crab mode, translate the UI's normal movement keys into those
+            # shifted variants explicitly; do not depend on terminal modifiers.
+            if ch.lower() in "uiojlm":
+                ch = ch.upper() if self.pad.crab_mode else ch.lower()
+            elif ch == "," and self.pad.crab_mode:
+                ch = "<"
+            elif ch == "." and self.pad.crab_mode:
+                ch = ">"
+            elif ch.isalpha() and ch.lower() not in "uiojlm":
+                ch = ch.lower()
             self.teleop.send(ch)
             self.pad.press(ch)
             event.stop()
@@ -653,6 +721,12 @@ class RoverTUI(App):
     async def action_restart_teleop(self) -> None:
         await self.teleop.restart()
 
+    async def action_restart_pivot_echo(self) -> None:
+        await self.pivot_echo.restart()
+
+    async def action_restart_joy_drive(self) -> None:
+        await self.joy_drive.restart()
+
     # ── shutdown ──
     async def shutdown_all(self) -> None:
         if self._down:
@@ -661,7 +735,21 @@ class RoverTUI(App):
         self.teleop.send("k")  # publish a stop before we go
         await asyncio.sleep(0.15)
         await asyncio.gather(*(p.shutdown() for p in self.esps), self.controller.shutdown(),
-                             self.teleop.shutdown(), return_exceptions=True)
+                             self.teleop.shutdown(), self.pivot_echo.shutdown(), self.joy_drive.shutdown(),
+                             return_exceptions=True)
+        # Stop AntiMicroX only if the instance we launched is still running.
+        # If it handed the request to an already-running single instance, its
+        # short-lived launcher process will already have exited.
+        proc = self.antimicrox_proc
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
 
     async def action_quit(self) -> None:
         await self.shutdown_all()
