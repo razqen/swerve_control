@@ -5,6 +5,8 @@ rover_tui.py - eDEX-style control deck for the rover.
 Runs in the background (each inside its own pty):
   * python3 controller_sh.py
   * ros2 run teleop_twist_keyboard teleop_twist_keyboard
+  * python3 joy_drive.py
+  * ros2 topic echo /pivot_encoders
   * ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyUSB0   (ESP-0)
   * ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyUSB1   (ESP-1)
 
@@ -20,7 +22,8 @@ Run it from a shell where ROS is sourced (so `ros2` and micro_ros_agent work):
 Keys:  u i o / j k l / m , .   drive (space = stop)
        Caps Lock toggles crab/holonomic mode (shifted teleop keys); Space = stop
        q/z  all speeds +/-10%   w/x  linear +/-   e/c  angular +/-
-       1 / 2  manual reset ESP-0 / ESP-1      F5 / F6 / F7 / F8  restart controller / teleop / pivot echo / joy_drive
+       1 / 2  manual reset ESP-0 / ESP-1      F5 / F6  restart controller / teleop
+       F7 / F8  restart joy_drive / pivot_encoders echo
        Ctrl+Q  quit (sends a stop first)
 """
 from __future__ import annotations
@@ -48,10 +51,9 @@ from textual.widgets import Button, Footer, RichLog, Static
 CONTROLLER_CMD = ["python3", "controller_sh.py"]
 CONTROLLER_CWD = None  # None = directory you launch this from
 TELEOP_CMD = ["ros2", "run", "teleop_twist_keyboard", "teleop_twist_keyboard"]
-PIVOT_ECHO_CMD = ["ros2", "topic", "echo", "/pivot_encoders"]
-JOY_DRIVE_CMD = ["python3", "joy_drive.py"]
-# Change this path to select a different AntiMicroX controller profile.
-ANTIMICROX_PROFILE = "~/rover.gamecontroller.amgp"
+JOY_CMD = ["python3", "joy_drive.py"]
+JOY_CWD = None  # None = directory you launch this from
+ENC_CMD = ["ros2", "topic", "echo", "/pivot_encoders"]
 
 ESPS = [("ESP-0", "/dev/ttyUSB0"), ("ESP-1", "/dev/ttyUSB1")]
 
@@ -350,8 +352,8 @@ class KeyPad(Static):
         else:
             out.append(f"  LIN {self.lin:5.2f} m/s   ANG {self.ang:5.2f} rad/s", style="bold #4fe3f5")
         out.append("\n")
-        out.append("  q/z all±  w/x lin±  e ang+  c crab toggle  space = stop", style="#2a6f7a")
-        out.append("\n  CRAB MODE  ", style="bold #001014 on #4fe3f5" if self.crab_mode else "#2a6f7a")
+        out.append("  q/z all±  w/x lin±  e/c ang±   space = stop", style="#2a6f7a")
+        out.append("\n  CAPS LOCK = CRAB MODE  ", style="bold #001014 on #4fe3f5" if self.crab_mode else "#2a6f7a")
         out.append("ON" if self.crab_mode else "OFF", style="bold #001014 on #19c37d" if self.crab_mode else "bold #e5c07b")
         self.update(out)
 
@@ -597,7 +599,7 @@ class RoverTUI(App):
     #crab { height: 3; margin: 0 1; border: round #1f6f7d; background: #03080b; color: #2fd0e6; }
     #crab.crab-on { border: heavy #19c37d; background: #06251a; color: #8affc5; text-style: bold; }
     #bottom { height: 12; }
-    ProcLog { width: 1fr; min-width: 0; border: round #1f6f7d; border-title-color: #4fe3f5; background: #03080b; }
+    ProcLog { width: 1fr; border: round #1f6f7d; border-title-color: #4fe3f5; background: #03080b; }
     Footer { background: #07161b; }
     """
 
@@ -606,25 +608,24 @@ class RoverTUI(App):
         Binding("2", "reset_esp(1)", "Reset ESP-1"),
         Binding("f5", "restart_controller", "Restart controller"),
         Binding("f6", "restart_teleop", "Restart teleop"),
-        Binding("f7", "restart_pivot_echo", "Restart pivot echo"),
-        Binding("f8", "restart_joy_drive", "Restart joy_drive.py"),
+        Binding("f7", "restart_joy", "Restart joy"),
+        Binding("f8", "restart_enc", "Restart encoders"),
         Binding("ctrl+q", "quit", "Quit"),
     ]
 
     def __init__(self):
         super().__init__()
         self._down = False
-        self.antimicrox_proc: asyncio.subprocess.Process | None = None
 
     def compose(self) -> ComposeResult:
         self.pad = KeyPad(id="pad")
         self.controller = ProcLog("controller_sh.py", CONTROLLER_CMD, cwd=CONTROLLER_CWD)
         self.teleop = ProcLog("teleop_twist_keyboard", TELEOP_CMD, on_text=self._teleop_text)
-        self.pivot_echo = ProcLog("ros2 topic echo /pivot_encoders", PIVOT_ECHO_CMD)
-        self.joy_drive = ProcLog("joy_drive.py", JOY_DRIVE_CMD)
+        self.joy = ProcLog("joy_drive.py", JOY_CMD, cwd=JOY_CWD)
+        self.enc = ProcLog("/pivot_encoders", ENC_CMD)
         self.esps = [EspPanel(n, p, i + 1) for i, (n, p) in enumerate(ESPS)]
         yield Static(id="hdr")
-        self.crab_button = Button("CRAB MODE: OFF  [c to toggle]", id="crab", disabled=True)
+        self.crab_button = Button("CRAB MODE: OFF", id="crab", disabled=True)
         with Horizontal(id="top"):
             with Vertical(id="controls"):
                 yield self.pad
@@ -635,36 +636,16 @@ class RoverTUI(App):
         with Horizontal(id="bottom"):
             yield self.controller
             yield self.teleop
-            yield self.pivot_echo
-            yield self.joy_drive
+            yield self.joy
+            yield self.enc
         yield Footer()
 
-    async def on_mount(self) -> None:
+    def on_mount(self) -> None:
         self.set_interval(0.5, self._header)
-        await self.start_antimicrox()
-
-    async def start_antimicrox(self) -> None:
-        """Launch AntiMicroX hidden with the configured profile."""
-        profile = os.path.abspath(os.path.expanduser(ANTIMICROX_PROFILE))
-        if not os.path.isfile(profile):
-            self.notify(f"AntiMicroX profile not found: {profile}", severity="error")
-            return
-        try:
-            self.antimicrox_proc = await asyncio.create_subprocess_exec(
-                "antimicrox", "--hidden", "--profile", profile,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            self.notify("antimicrox not found; install it or check PATH", severity="error")
-        except Exception as e:
-            self.notify(f"Could not launch AntiMicroX: {e}", severity="error")
 
     def set_crab_mode(self, enabled: bool) -> None:
         self.pad.set_crab_mode(enabled)
-        self.crab_button.label = "CRAB MODE: ON  [c to toggle]" if enabled else "CRAB MODE: OFF  [c to toggle]"
+        self.crab_button.label = "CRAB MODE: ON" if enabled else "CRAB MODE: OFF"
         self.crab_button.set_class(enabled, "crab-on")
 
     def _header(self) -> None:
@@ -684,28 +665,33 @@ class RoverTUI(App):
 
     # ── input ──
     def on_key(self, event: events.Key) -> None:
-        ch = event.character
-        if ch == " ":
-            ch = "k"
-
-        # Use c as a dedicated crab-mode toggle. Do not forward it to teleop,
-        # where c normally decreases angular speed.
-        if ch and ch.lower() == "c":
+        # Text terminals don't deliver a held Shift modifier to the child PTY.
+        # Caps Lock therefore toggles the teleop's shifted (holonomic/crab) keys.
+        if event.key in {"caps_lock", "capslock"}:
             self.set_crab_mode(not self.pad.crab_mode)
             event.stop()
             return
 
+        ch = event.character
+        if ch == " ":
+            ch = "k"
+
+        # Most terminal emulators don't send a standalone Caps Lock event;
+        # they send uppercase characters instead. Infer its state from letters.
+        # Shift and Caps Lock are indistinguishable to a terminal, so uppercase
+        # letters intentionally mean crab mode here too.
+        if ch and ch.isalpha():
+            self.set_crab_mode(ch.isupper())
+
         if ch and ch in TELEOP_KEYS | {"k"}:
-            # teleop_twist_keyboard uses shifted movement keys for strafing.
-            # In crab mode, translate the UI's normal movement keys into those
-            # shifted variants explicitly; do not depend on terminal modifiers.
-            if ch.lower() in "uiojlm":
-                ch = ch.upper() if self.pad.crab_mode else ch.lower()
+            if ch.lower() in "uiojlm" and self.pad.crab_mode:
+                ch = ch.upper()
             elif ch == "," and self.pad.crab_mode:
                 ch = "<"
             elif ch == "." and self.pad.crab_mode:
                 ch = ">"
             elif ch.isalpha() and ch.lower() not in "uiojlm":
+                # Caps Lock should not change speed/vertical control bindings.
                 ch = ch.lower()
             self.teleop.send(ch)
             self.pad.press(ch)
@@ -721,11 +707,11 @@ class RoverTUI(App):
     async def action_restart_teleop(self) -> None:
         await self.teleop.restart()
 
-    async def action_restart_pivot_echo(self) -> None:
-        await self.pivot_echo.restart()
+    async def action_restart_joy(self) -> None:
+        await self.joy.restart()
 
-    async def action_restart_joy_drive(self) -> None:
-        await self.joy_drive.restart()
+    async def action_restart_enc(self) -> None:
+        await self.enc.restart()
 
     # ── shutdown ──
     async def shutdown_all(self) -> None:
@@ -735,21 +721,8 @@ class RoverTUI(App):
         self.teleop.send("k")  # publish a stop before we go
         await asyncio.sleep(0.15)
         await asyncio.gather(*(p.shutdown() for p in self.esps), self.controller.shutdown(),
-                             self.teleop.shutdown(), self.pivot_echo.shutdown(), self.joy_drive.shutdown(),
+                             self.teleop.shutdown(), self.joy.shutdown(), self.enc.shutdown(),
                              return_exceptions=True)
-        # Stop AntiMicroX only if the instance we launched is still running.
-        # If it handed the request to an already-running single instance, its
-        # short-lived launcher process will already have exited.
-        proc = self.antimicrox_proc
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
 
     async def action_quit(self) -> None:
         await self.shutdown_all()
