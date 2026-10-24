@@ -12,7 +12,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 
-VALID_KEYS = ['3', '4', '5', '6', '7', '8', ' ', 'h', '1', '2']
+VALID_KEYS = ['3', '4', '5', '6', '7', '8', ' ', 'h']
 
 class AckermannDriveController(Node):
     def __init__(self):
@@ -42,10 +42,6 @@ class AckermannDriveController(Node):
         self.last_key = ''
         self.last_key_time = self.get_clock().now()
 
-        # Actuator Variables
-        self.actuator_cmd = 0.0
-        self.last_actuator_time = self.get_clock().now()
-
         # Protects state shared between keyboard thread and publish timer
         self.lock = threading.Lock()
         self.running = True
@@ -59,7 +55,7 @@ class AckermannDriveController(Node):
         self.get_logger().info(
             "Ackermann Controller Started. [3] Fwd  [4] Left  [5] Rev  "
             "[6] Right  [7] Crab L  [8] Crab R  [h] Home  [SPACE] Stop  "
-            "Actuator: [1]/[2]  Quit: Ctrl+C. Streaming at 20Hz..."
+            "Quit: Ctrl+C. Streaming at 20Hz..."
         )
 
     def start_keyboard(self):
@@ -113,16 +109,6 @@ class AckermannDriveController(Node):
     def handle_key(self, key):
         with self.lock:
             now = self.get_clock().now()
-
-            # Actuator Controls (1 = Push, 2 = Pull)
-            if key == '1':
-                self.actuator_cmd = 1.0
-                self.last_actuator_time = now
-                return
-            elif key == '2':
-                self.actuator_cmd = 2.0
-                self.last_actuator_time = now
-                return
 
             # High-Frequency Key Repeat Filter (speed keys only)
             if key in ['3', '5', '7', '8']:
@@ -182,16 +168,10 @@ class AckermannDriveController(Node):
         with self.lock:
             self.vx = 0.0
             self.center_steer = 0.0
-            self.actuator_cmd = 0.0
         self.publish_state()
 
     def publish_state(self):
         with self.lock:
-            # Actuator Auto-Stop Logic
-            now = self.get_clock().now()
-            if (now - self.last_actuator_time).nanoseconds / 1e9 > 0.2:
-                self.actuator_cmd = 0.0
-
             msg_angles = Float32MultiArray()
             msg_wheels = Float32MultiArray()
 
@@ -268,7 +248,7 @@ class AckermannDriveController(Node):
                 float(v_lr),
                 float(v_rf),
                 float(v_rr),
-                float(self.actuator_cmd),
+                0.0,  # actuator slot, kept so the message layout is unchanged
             ]
             self.pub_wheels.publish(msg_wheels)
 
@@ -278,8 +258,7 @@ class AckermannDriveController(Node):
                 f"Speed: {self.vx:5.1f} | "
                 f"Input: {self.center_steer:5.1f}° | "
                 f"W0(L): {angles[0]:5.1f}° | "
-                f"W2(R): {angles[2]:5.1f}° | "
-                f"Act: {int(self.actuator_cmd)}    ",
+                f"W2(R): {angles[2]:5.1f}°    ",
                 end="",
                 flush=True,
             )
