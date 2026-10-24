@@ -20,8 +20,9 @@ Run it from a shell where ROS is sourced (so `ros2` and micro_ros_agent work):
     python3 rover_tui.py
 
 Keys:  u i o / j k l / m , .   drive (space = stop)
-       Caps Lock toggles crab/holonomic mode (shifted teleop keys); Space = stop
-       q/z  all speeds +/-10%   w/x  linear +/-   e/c  angular +/-
+       c toggles crab/holonomic mode (shifted teleop keys); Space = stop
+       q/z  all speeds +/-10%   w/x  linear +/-   e  angular +
+       3 4 5 6 7 8 h space  forwarded to joy_drive.py (space also stops teleop)
        1 / 2  manual reset ESP-0 / ESP-1      F5 / F6  restart controller / teleop
        F7 / F8  restart joy_drive / pivot_encoders echo
        Ctrl+Q  quit (sends a stop first)
@@ -128,9 +129,12 @@ def make_line(raw: str, cls: str) -> Text:
 class PtyProc:
     """Child process on a pty (line-buffered output, real TTY for teleop's termios)."""
 
-    def __init__(self, cmd, on_line, on_exit=None, cwd=None):
+    def __init__(self, cmd, on_line, on_exit=None, cwd=None, cr_overwrite=False):
         self.cmd = list(cmd)
         self.on_line = on_line
+        # cr_overwrite: lines ended by a bare "\r" are in-place status redraws;
+        # on_line(text, transient) is called so the UI can overwrite instead of append.
+        self.cr_overwrite = cr_overwrite
         self.on_exit = on_exit
         self.cwd = cwd
         self.proc: asyncio.subprocess.Process | None = None
@@ -178,6 +182,17 @@ class PtyProc:
         if not data:
             return -1
         self.buf += data.decode("utf-8", "replace")
+        if self.cr_overwrite:
+            parts = re.split(r"(\r\n|\r|\n)", self.buf)
+            self.buf = parts.pop()
+            if not self.buf and parts and parts[-1] == "\r":
+                # a trailing \r may be the first half of \r\n; wait for the next chunk
+                term = parts.pop()
+                self.buf = parts.pop() + term
+            for text, term in zip(parts[0::2], parts[1::2]):
+                if text.strip():
+                    self.on_line(text, term == "\r")
+            return 1
         parts = re.split(r"\r\n|\r|\n", self.buf)
         self.buf = parts.pop()
         for p in parts:
@@ -202,7 +217,11 @@ class PtyProc:
         while self._pump() > 0:
             pass
         if self.buf.strip():
-            self.on_line(self.buf)
+            text = self.buf.rstrip("\r")
+            if self.cr_overwrite:
+                self.on_line(text, False)
+            else:
+                self.on_line(self.buf)
             self.buf = ""
         self._unregister()
         if self.master is not None:
@@ -271,7 +290,9 @@ KEYS = [
 ]
 SHIFT_MAP = {"<": ",", ">": "."}
 # teleop_twist_keyboard bindings we forward (+ holonomic shift variants, z up/down, speed keys)
-TELEOP_KEYS = set("uiojlm,.UIOJLM<>tbqzwxec")
+TELEOP_KEYS = set("uiojlm,.<>tbqzwxe")  # "c" is the crab-mode toggle, not forwarded
+# joy_drive.py keys (it lower-cases input itself); space also goes to joy_drive as its e-stop
+JOY_KEYS = set("345678h")
 
 # palette per brightness level: (border, key, arrow, label, background)
 PAL = {
@@ -352,8 +373,8 @@ class KeyPad(Static):
         else:
             out.append(f"  LIN {self.lin:5.2f} m/s   ANG {self.ang:5.2f} rad/s", style="bold #4fe3f5")
         out.append("\n")
-        out.append("  q/z all±  w/x lin±  e/c ang±   space = stop", style="#2a6f7a")
-        out.append("\n  CAPS LOCK = CRAB MODE  ", style="bold #001014 on #4fe3f5" if self.crab_mode else "#2a6f7a")
+        out.append("  q/z all±  w/x lin±  e ang+   space = stop", style="#2a6f7a")
+        out.append("\n  C = CRAB MODE  ", style="bold #001014 on #4fe3f5" if self.crab_mode else "#2a6f7a")
         out.append("ON" if self.crab_mode else "OFF", style="bold #001014 on #19c37d" if self.crab_mode else "bold #e5c07b")
         self.update(out)
 
@@ -362,15 +383,33 @@ class KeyPad(Static):
 class ProcLog(RichLog):
     can_focus = False
 
-    def __init__(self, title, cmd, cwd=None, on_text=None, **kw):
+    def __init__(self, title, cmd, cwd=None, on_text=None, cr_overwrite=False, **kw):
         super().__init__(wrap=False, highlight=False, markup=False, max_lines=500,
                          auto_scroll=True, **kw)
         self.title = title
         self.cmd = cmd
         self.cwd = cwd
         self.on_text = on_text
+        self.cr_overwrite = cr_overwrite
+        self._hist: deque[Text] = deque(maxlen=30)   # committed lines (cr_overwrite mode)
+        self._live: Text | None = None                # current in-place status line
         self.proc: PtyProc | None = None
         self.closing = False
+
+    def _emit(self, t: Text, transient: bool = False) -> None:
+        if not self.cr_overwrite:
+            self.write(t)
+            return
+        if transient:
+            self._live = t
+        else:
+            self._live = None
+            self._hist.append(t)
+        self.clear()
+        for h in self._hist:
+            self.write(h)
+        if self._live is not None:
+            self.write(self._live)
 
     def set_status(self, s: str) -> None:
         self.border_title = f"{self.title} · {s}"
@@ -380,25 +419,27 @@ class ProcLog(RichLog):
         await self.start()
 
     async def start(self) -> None:
-        proc = PtyProc(self.cmd, self._line, self._exit, cwd=self.cwd)
+        proc = PtyProc(self.cmd, self._line, self._exit, cwd=self.cwd,
+                       cr_overwrite=self.cr_overwrite)
         self.proc = proc
+        self._live = None
         try:
             await proc.start()
         except Exception as e:
-            self.write(Text(f"! cannot launch {' '.join(self.cmd)}: {e}", style="bold red"))
+            self._emit(Text(f"! cannot launch {' '.join(self.cmd)}: {e}", style="bold red"))
             self.set_status("FAILED")
             return
         self.set_status("● RUNNING")
 
-    def _line(self, raw: str) -> None:
-        self.write(make_line(raw, "info"))
+    def _line(self, raw: str, transient: bool = False) -> None:
+        self._emit(make_line(raw, "info"), transient)
         if self.on_text:
             self.on_text(strip_ansi(raw))
 
     def _exit(self, proc: PtyProc, rc: int) -> None:
         if proc is not self.proc or proc.stopping:
             return
-        self.write(Text(f"» process exited (rc={rc})", style="bold red"))
+        self._emit(Text(f"» process exited (rc={rc})", style="bold red"))
         self.set_status(f"EXITED rc={rc}")
 
     def send(self, s: str) -> None:
@@ -408,7 +449,7 @@ class ProcLog(RichLog):
     async def restart(self) -> None:
         if self.proc:
             await self.proc.stop()
-        self.write(Text("» restarting…", style="cyan"))
+        self._emit(Text("» restarting…", style="cyan"))
         await self.start()
 
     async def shutdown(self) -> None:
@@ -621,7 +662,7 @@ class RoverTUI(App):
         self.pad = KeyPad(id="pad")
         self.controller = ProcLog("controller_sh.py", CONTROLLER_CMD, cwd=CONTROLLER_CWD)
         self.teleop = ProcLog("teleop_twist_keyboard", TELEOP_CMD, on_text=self._teleop_text)
-        self.joy = ProcLog("joy_drive.py", JOY_CMD, cwd=JOY_CWD)
+        self.joy = ProcLog("joy_drive.py", JOY_CMD, cwd=JOY_CWD, cr_overwrite=True)
         self.enc = ProcLog("/pivot_encoders", ENC_CMD)
         self.esps = [EspPanel(n, p, i + 1) for i, (n, p) in enumerate(ESPS)]
         yield Static(id="hdr")
@@ -665,34 +706,34 @@ class RoverTUI(App):
 
     # ── input ──
     def on_key(self, event: events.Key) -> None:
-        # Text terminals don't deliver a held Shift modifier to the child PTY.
-        # Caps Lock therefore toggles the teleop's shifted (holonomic/crab) keys.
-        if event.key in {"caps_lock", "capslock"}:
+        # Text terminals don't deliver a held Shift modifier to the child PTY, so
+        # crab mode is a toggle on "c" that swaps teleop's keys for the shifted ones.
+        ch = event.character
+        if ch and ch.lower() == "c":
             self.set_crab_mode(not self.pad.crab_mode)
             event.stop()
             return
-
-        ch = event.character
+        joy_ch = None
         if ch == " ":
             ch = "k"
+            joy_ch = " "
+        elif ch and ch.lower() in JOY_KEYS:
+            joy_ch = ch.lower()
+        if joy_ch is not None:
+            self.joy.send(joy_ch)
+            event.stop()
 
-        # Most terminal emulators don't send a standalone Caps Lock event;
-        # they send uppercase characters instead. Infer its state from letters.
-        # Shift and Caps Lock are indistinguishable to a terminal, so uppercase
-        # letters intentionally mean crab mode here too.
         if ch and ch.isalpha():
-            self.set_crab_mode(ch.isupper())
+            ch = ch.lower()  # a stray Caps Lock/Shift must not change teleop's bindings
 
         if ch and ch in TELEOP_KEYS | {"k"}:
-            if ch.lower() in "uiojlm" and self.pad.crab_mode:
-                ch = ch.upper()
-            elif ch == "," and self.pad.crab_mode:
-                ch = "<"
-            elif ch == "." and self.pad.crab_mode:
-                ch = ">"
-            elif ch.isalpha() and ch.lower() not in "uiojlm":
-                # Caps Lock should not change speed/vertical control bindings.
-                ch = ch.lower()
+            if self.pad.crab_mode:
+                if ch in "uiojlm":
+                    ch = ch.upper()
+                elif ch == ",":
+                    ch = "<"
+                elif ch == ".":
+                    ch = ">"
             self.teleop.send(ch)
             self.pad.press(ch)
             event.stop()
