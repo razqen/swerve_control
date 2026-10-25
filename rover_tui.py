@@ -719,6 +719,8 @@ class RoverTUI(App):
             joy_ch = " "
         elif ch and ch.lower() in JOY_KEYS:
             joy_ch = ch.lower()
+        elif ch and ch.lower() == "k":
+            joy_ch = "h"  # teleop's stop key also homes joy_drive, so one key stops both
         if joy_ch is not None:
             self.joy.send(joy_ch)
             event.stop()
