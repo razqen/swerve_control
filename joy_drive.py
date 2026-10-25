@@ -10,7 +10,7 @@ import tty
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 
 VALID_KEYS = ['3', '4', '5', '6', '7', '8', ' ', 'h']
 
@@ -18,11 +18,10 @@ class AckermannDriveController(Node):
     def __init__(self):
         super().__init__('ackermann_drive_controller')
 
-        # Publishers
-        self.pub_angles = self.create_publisher(
-            Float32MultiArray, 'target_angles', 10)
-        self.pub_wheels = self.create_publisher(
-            Float32MultiArray, '/wheel_speeds', 10)
+        self.pub_cmd = self.create_publisher(
+            Float32MultiArray, '/joy_drive_cmd', 10)
+        self.sub_source = self.create_subscription(
+            String, '/drive_source', self.source_callback, 10)
 
         # Rover Dimensions
         self.L = 1.0  # Wheelbase
@@ -46,6 +45,11 @@ class AckermannDriveController(Node):
         self.lock = threading.Lock()
         self.running = True
 
+        # Key-hit tracking (see pub_cmd above)
+        self.key_seq = 0
+        self.last_press = None
+        self.settle_s = 1.0
+
         # Continuous Publishing Timer (20Hz)
         self.timer = self.create_timer(0.05, self.publish_state)
 
@@ -54,9 +58,27 @@ class AckermannDriveController(Node):
 
         self.get_logger().info(
             "Ackermann Controller Started. [3] Fwd  [4] Left  [5] Rev  "
-            "[6] Right  [7] Crab L  [8] Crab R  [h] Home  [SPACE] Stop  "
+            "[6] Right  [7] Crab L  [8] Crab R  [h]/[SPACE] Home  "
             "Quit: Ctrl+C. Streaming at 20Hz..."
         )
+
+    def source_callback(self, msg):
+        """If teleop took over after our last key, drop our state so we don't resume
+        at a stale speed/steer when one of our keys is hit again."""
+        parts = msg.data.split()
+        if len(parts) != 2 or parts[0] != 'teleop':
+            return
+        try:
+            echoed = int(parts[1])
+        except ValueError:
+            return
+        if echoed != self.key_seq:
+            return  # the controller hasn't seen our latest key yet
+        with self.lock:
+            self.mode = 'ackermann'
+            self.vx = 0.0
+            self.center_steer = 0.0
+            self.last_key = ''
 
     def start_keyboard(self):
         self.kb_start_timer.cancel()  # one-shot
@@ -110,6 +132,10 @@ class AckermannDriveController(Node):
         with self.lock:
             now = self.get_clock().now()
 
+            # Any of our keys being hit claims control (see pub_cmd)
+            self.key_seq = (self.key_seq + 1) % 1000000
+            self.last_press = now
+
             # High-Frequency Key Repeat Filter (speed keys only)
             if key in ['3', '5', '7', '8']:
                 time_diff = (now - self.last_key_time).nanoseconds / 1e9
@@ -151,30 +177,24 @@ class AckermannDriveController(Node):
                 else:
                     self.vx = max(-self.max_v, self.vx - self.lin_step)
 
-            # Home: back to Ackermann
-            elif key == 'h':
+            # Home / stop (h or SPACE): back to Ackermann, wheels centred, stopped
+            elif key in ('h', ' '):
                 self.mode = 'ackermann'
-                self.vx = 0.0
-                self.center_steer = 0.0
-
-            # Emergency Stop
-            elif key == ' ':
                 self.vx = 0.0
                 self.center_steer = 0.0
                 self.last_key = ''
 
     def stop_and_publish(self):
-        """Zero everything and send one final command (used on Ctrl+C)."""
+        """Zero everything and send one final zero command (used on Ctrl+C)."""
         with self.lock:
             self.vx = 0.0
             self.center_steer = 0.0
-        self.publish_state()
+        msg = Float32MultiArray()
+        msg.data = [0.0] * 8 + [float(self.key_seq)]
+        self.pub_cmd.publish(msg)
 
     def publish_state(self):
         with self.lock:
-            msg_angles = Float32MultiArray()
-            msg_wheels = Float32MultiArray()
-
             if self.mode == 'crab':
                 angles = [90.0, 90.0, 90.0, 90.0]
 
@@ -239,18 +259,18 @@ class AckermannDriveController(Node):
                 v_rf = mag_rf * direction
                 v_rr = mag_rr * direction
 
-            # Publish
-            msg_angles.data = [float(a) for a in angles]
-            self.pub_angles.publish(msg_angles)
-
-            msg_wheels.data = [
-                float(v_lf),
-                float(v_lr),
-                float(v_rf),
-                float(v_rr),
-                0.0,  # actuator slot, kept so the message layout is unchanged
-            ]
-            self.pub_wheels.publish(msg_wheels)
+            idle = (self.mode == 'ackermann'
+                    and abs(self.vx) < 1e-6
+                    and abs(self.center_steer) < 1e-6)
+            now = self.get_clock().now()
+            recent = (self.last_press is not None
+                      and (now - self.last_press).nanoseconds / 1e9 < self.settle_s)
+            if not idle or recent:
+                msg = Float32MultiArray()
+                msg.data = [float(a) for a in angles] + [
+                    float(v_lf), float(v_lr), float(v_rf), float(v_rr),
+                    float(self.key_seq)]
+                self.pub_cmd.publish(msg)
 
             # Dashboard Feedback
             print(
